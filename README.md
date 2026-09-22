@@ -6,6 +6,7 @@
 
 | 规则 | 触发 | 说明 |
 |---|---|---|
+| ⓪ 其他设备操作 | `bash` 里出现 `adb`/`ssh`/`scp`/`sftp`(含 `ADB=$HOME/.../adb` 这类变量包装) | 设备侧路径**不按**本机路径判定；整类只确认一次，选"始终允许"后本次运行内同工具的动作一律放行 |
 | ① 文件删除 | `bash` 启发式 | `rm` / `rmdir` / `unlink` / `shred` / `trash` / `gio trash` / `find -delete` / `find -exec rm` / `xargs rm` / `git clean`，**任意路径**(含 cwd 内)都要确认 |
 | ② 越界操作(含读) | `read`/`ls`/`grep`/`find`/`write`/`edit` 的 `path` 参数 + `bash`/`powershell` 启发式 | 目标 resolve 后不在 cwd 及其子目录内 → 确认 |
 
@@ -50,7 +51,7 @@ cp agents/*.md ~/.pi/agent/agents/
 - **🔁 始终允许(本次 pi 运行)** —— 写入进程内授权表(类别 × 目录)，重启即失效
 - **🚫 拒绝** —— 拦截，命令保留在会话里供你自行执行
 
-授权粒度 = 类别(read / write / delete / other) × 目录：读 `/etc/passwd` 选"始终允许" = 放行读 `/etc/` 下所有文件，但不会连带放行写/删 `/etc`。
+授权粒度 = 类别(read / write / delete / device / other) × 键：路径类键是**目录**(读 `/etc/passwd` 选"始终允许" = 放行读 `/etc/` 下所有文件，但不会连带放行写/删 `/etc`)；`device` 类的键是**工具**(`device:adb` / `device:ssh`)，互不串。
 
 弹框内容只显示**目标 + 命令**，并且都截断过(长内容会把选项按钮顶出屏幕)：最多 `DIALOG_MAX_TARGETS` 个目标、命令最多 `DIALOG_MAX_CMD_CHARS` 字。完整命令在"拒绝"的理由里。
 
@@ -83,6 +84,7 @@ node test-logic.mjs   # 纯逻辑断言(analyzeBash / isInside)，不需要 pi �
 - **这是"确认门"，不是沙箱**：bash 启发式解析不了变量拼接、管道、子 shell、`python -c` 等写法，模型可以用这些绕过。要物理隔离请用容器/VM(见 pi 官方 `containerization.md`)。
 - 启发式会误报(如 Windows 风格斜杠开关 `/f`、`export FOO=/tmp/x`)，宁可多拦。
 - 子代理转发依赖 pi-web 内部的 `__piSessions` 全局；pi-web 大版本升级若改名，会静默退回子代理自己的会话(门禁仍生效，只是位置变回子代理页)。
+- `adb`/`ssh` 判定是启发式的：命令里只要出现这些工具就整类按"设备操作"处理，所以 `which adb` 之类也会算；反过来，一个命令里若同时混了 adb/ssh 和本机的破坏性操作(如 `adb push x /data && rm -rf build`)，会跟着设备授权一起放行。要更强的区分只能改成解析 AST。
 
 ## 维护
 

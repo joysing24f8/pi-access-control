@@ -1,7 +1,9 @@
 /**
  * permission-gate.ts — 路径权限门禁扩展(pi / pi-web 通用)
  *
- * 两条规则:
+ * 三条规则(只针对本机路径):
+ *   ⓪ adb / ssh / scp / sftp 操作的是其他设备, 设备侧路径不按本机路径判定:
+ *      整类只确认一次, 选"始终允许"后本次运行内同工具的后续动作一律放行;
  *   ① 文件删除(任意路径, 含 cwd 内): 弹框确认后才放行;
  *   ② 目标路径解析后不在当前工作目录(cwd)及其子目录内: 弹框确认后才放行。
  *
@@ -85,12 +87,13 @@ const REDIRECT = /(?:^|[\s;&|])(>{1,2})/;
 const OPAQUE_SUBST = /\$\(|`/;
 
 // ---------- 授权表(进程级, 重启失效) ----------
-type Category = "read" | "write" | "delete" | "other";
+type Category = "read" | "write" | "delete" | "device" | "other";
 
 const CATEGORY_LABEL: Record<Category, string> = {
   read: "越界读取",
   write: "越界写入",
   delete: "删除",
+  device: "其他设备操作",
   other: "越界操作",
 };
 
@@ -155,24 +158,32 @@ function grantKey(p: string): string {
   return path.dirname(abs);
 }
 
-function isAllowed(category: Category, target: string): boolean {
+/** 授权键匹配: 相等, 或 key 在 allowed 目录之下(路径键以 "/" 分隔; device:xxx 这种工具键只相等匹配) */
+function isKeyAllowed(category: Category, key: string): boolean {
   const set = ALLOWED.get(category);
   if (!set) return false;
-  const key = grantKey(target);
   for (const allowed of set) {
     if (key === allowed || key.startsWith(allowed + SEP)) return true;
   }
   return false;
 }
 
-function grant(category: Category, target: string): void {
-  const key = grantKey(target);
+function grantKeyValue(category: Category, key: string): void {
   let set = ALLOWED.get(category);
   if (!set) {
     set = new Set();
     ALLOWED.set(category, set);
   }
   set.add(key);
+}
+
+/** 路径目标的便捷封装(目录粒度) */
+function isAllowed(category: Category, target: string): boolean {
+  return isKeyAllowed(category, grantKey(target));
+}
+
+function grant(category: Category, target: string): void {
+  grantKeyValue(category, grantKey(target));
 }
 
 // ---------- 弹框排队 ----------
@@ -236,9 +247,30 @@ function redirectTargets(command: string, cwd: string): string[] {
   return out;
 }
 
+// ---------- 其他设备(adb / ssh 等) ----------
+/** 这些工具操作的是别的设备, 设备侧路径不按本机路径判定 */
+const DEVICE_TOOLS = new Set(["adb", "ssh", "scp", "sftp"]);
+
+/**
+ * 命令是不是在操作其他设备。认两种写法:
+ *   1. 命令里出现 `adb`/`ssh`/`scp`/`sftp` 这个词(前后是空白/分隔符, 所以 sshd、.ssh、ssh-keygen 不算);
+ *   2. 路径 token 的 basename 就是它 —— 覆盖 `ADB=$HOME/tools/platform-tools/adb; "$ADB" ...` 这种变量包装写法。
+ */
+function deviceTool(command: string): string | undefined {
+  const word = command.match(/(?:^|[\s;&|(])(adb|ssh|scp|sftp)(?=\s|$)/);
+  if (word) return word[1];
+  for (const t of extractPathTokens(command)) {
+    if (DEVICE_TOOLS.has(path.basename(t.replace(/["']+$/, "")))) {
+      return path.basename(t.replace(/["']+$/, ""));
+    }
+  }
+  return undefined;
+}
+
 interface BashFinding {
   category: Category;
-  targets: string[]; // resolve 后的绝对路径(越界部分)
+  targets: string[]; // 展示用: resolve 后的绝对路径
+  keys?: string[]; // 授权键; 缺省 = targets 各自的 grantKey(目录粒度)
   summary: string;
 }
 
@@ -247,6 +279,18 @@ interface BashFinding {
  * targets 为空数组表示"路径无法静态解析"(如 $()/反引号), 此时兜底确认。
  */
 function analyzeBash(command: string, cwd: string): BashFinding | null {
+  // 规则⓪: 操作其他设备(adb/ssh/scp/sftp)。设备侧路径不是本机路径, 不按 cwd 判定;
+  // 整类只确认一次 —— 选"始终允许"后, 本次运行内同工具的后续动作一律放行。
+  const tool = deviceTool(command);
+  if (tool) {
+    return {
+      category: "device",
+      targets: [],
+      keys: [`device:${tool}`],
+      summary: `${tool} 操作其他设备(设备侧路径不按本机路径判定)`,
+    };
+  }
+
   const isDelete = DELETE_PATTERNS.some((p) => p.test(command));
   const all = extractPathTokens(command).map((t) => resolvePath(t, cwd));
   const targets = all.filter((p) => !isInside(cwd, p));
@@ -377,8 +421,10 @@ async function requestApproval(
   targets: string[],
   summary: string,
   commandText: string,
+  keys?: string[],
 ): Promise<{ block: true; reason: string } | undefined> {
   const cwd = ctx.cwd;
+  const grantKeys = keys ?? targets.map((t) => grantKey(t));
 
   // 预留白名单(默认空数组, 不生效)
   if (ALLOWED_PATHS.length > 0 && targets.length > 0) {
@@ -391,8 +437,8 @@ async function requestApproval(
   // 读操作开关
   if (category === "read" && !CONFIRM_READS) return undefined;
 
-  // 已授权: 同类同路径(目录粒度)不再询问
-  if (targets.length > 0 && targets.every((t) => isAllowed(category, t))) return undefined;
+  // 已授权: 同类同键不再询问(路径键 = 目录粒度; 设备键 = 工具级)
+  if (grantKeys.length > 0 && grantKeys.every((k) => isKeyAllowed(category, k))) return undefined;
 
   const route = approvalTarget(ctx);
   if (!route) {
@@ -403,8 +449,8 @@ async function requestApproval(
   }
 
   return withQueue(route.key, async () => {
-    // 排队等待期间, 主会话或别的子代理可能已经授权过这个目录 → 直接放行, 不再弹框
-    if (targets.length > 0 && targets.every((t) => isAllowed(category, t))) return undefined;
+    // 排队等待期间, 主会话或别的子代理可能已经授权过同样的键 → 直接放行, 不再弹框
+    if (grantKeys.length > 0 && grantKeys.every((k) => isKeyAllowed(category, k))) return undefined;
 
     const deny = {
       block: true as const,
@@ -412,10 +458,10 @@ async function requestApproval(
     };
 
     // 弹框只给"目标 + 命令", 且都截断过
-    const title = `⚠️ ${category === "delete" ? "删除" : "越界"}确认${route.source ? `(${route.source})` : ""}`;
+    const title = `⚠️ ${category === "delete" ? "删除" : category === "device" ? "设备操作" : "越界"}确认${route.source ? `(${route.source})` : ""}`;
     const body =
       `${summary}\n` +
-      `  目标:\n${targetsText(targets)}\n\n` +
+      (targets.length > 0 ? `  目标:\n${targetsText(targets)}\n\n` : "") +
       `命令:\n${clip(commandText, DIALOG_MAX_CMD_CHARS)}`;
 
     const opts: { signal?: AbortSignal; timeout?: number } = { signal: ctx.signal };
@@ -424,13 +470,13 @@ async function requestApproval(
     try {
       if (USE_SELECT) {
         const options =
-          targets.length > 0
+          grantKeys.length > 0
             ? ["✅ 允许这一次", "🔁 始终允许(本次 pi 运行)", "🚫 拒绝"]
             : ["✅ 允许这一次", "🚫 拒绝"];
         const choice = await route.ui.select(`${title}\n\n${body}`, options, opts);
         if (choice === "✅ 允许这一次") return undefined;
         if (choice === "🔁 始终允许(本次 pi 运行)") {
-          for (const t of targets) grant(category, t);
+          for (const k of grantKeys) grantKeyValue(category, k);
           return undefined;
         }
         return deny;
@@ -475,7 +521,14 @@ export default function (pi: ExtensionAPI) {
     if (shellCommand !== undefined) {
       const finding = analyzeBash(shellCommand, cwd);
       if (!finding) return undefined;
-      return requestApproval(ctx, finding.category, finding.targets, finding.summary, shellCommand);
+      return requestApproval(
+        ctx,
+        finding.category,
+        finding.targets,
+        finding.summary,
+        shellCommand,
+        finding.keys,
+      );
     }
 
     // 结构化工具: 检查 path 参数是否越界
@@ -499,4 +552,13 @@ export default function (pi: ExtensionAPI) {
 }
 
 // ---------- 调试导出(供命令行自测) ----------
-export { analyzeBash, extractPathTokens, isInside, resolvePath, grant, isAllowed };
+export {
+  analyzeBash,
+  extractPathTokens,
+  isInside,
+  resolvePath,
+  grant,
+  isAllowed,
+  grantKeyValue,
+  isKeyAllowed,
+};

@@ -20,7 +20,7 @@ const src = readFileSync(join(root, "extensions", "permission-gate.ts"), "utf8")
 
 const CHECK = `
 import assert from "node:assert/strict";
-import { analyzeBash, grant, isAllowed, isInside, resolvePath } from "./logic.mts";
+import { analyzeBash, grant, grantKeyValue, isAllowed, isKeyAllowed, isInside, resolvePath } from "./logic.mts";
 
 const cwd = "/home/u/proj";
 const cat = (cmd) => analyzeBash(cmd, cwd)?.category ?? null;
@@ -96,16 +96,38 @@ assert.equal(isAllowed("delete", "/home"), false);
 // --- cd / 重定向: 只看目标本身是否越界(误报修复) ---
 const adbLike =
   'cd /home/u/proj && ADB="$HOME/tools/platform-tools/adb"; export SOCK=tcp:10.0.0.1:5037; timeout 40 $ADB -s x shell sed -n 1,40p';
-assert.equal(cat(adbLike), "read"); // cd 的是 cwd 本身, 越界的只是 $HOME 下的 adb
+assert.equal(cat(adbLike), "device"); // adb 变量包装 → 设备操作(旧: cd 的是 cwd 本身)
 assert.equal(cat("cd sub && echo x > /tmp/out"), "write"); // cd 在里面, 越界的是重定向
 assert.equal(cat("cd /opt && echo hi > out.txt"), "other"); // cd 真的出去了
 assert.equal(cat("cat /etc/hosts > out.txt"), "read"); // 重定向在里面, 越界的是读
 
 // --- 赋值边界: VAR=$HOME/... 也要提取(否则 X=$HOME/secret; cat $X 能绕过) ---
-assert.equal(cat("ADB=$HOME/tools/platform-tools/adb"), "other"); // 赋值越界; 命令本身不是读写命令 → other
+assert.equal(cat("ADB=$HOME/tools/platform-tools/adb"), "device"); // adb 变量包装 → 设备操作
 assert.equal(cat("X=$HOME/secret; cat $X"), "read");
 assert.equal(cat("P=/tmp/x"), "other"); // 纯赋值也拦(宁可多拦)
 assert.equal(cat("FOO=bar"), null); // 没有路径, 不拦
+
+// --- 设备操作: adb/ssh 等, 设备侧路径不按本机路径判定 ---
+assert.equal(cat("adb devices"), "device");
+assert.equal(cat("adb -s 4c61 shell rm -rf /data/local/tmp/x"), "device");
+assert.equal(cat("ssh root@10.0.0.1 'cat /etc/passwd'"), "device");
+assert.equal(cat("scp ./out root@10.0.0.1:/tmp/"), "device");
+const adbVar =
+  "cd /home/u/proj && ADB=$HOME/tools/platform-tools/adb; export S=tcp:10.0.0.1:5037; timeout 40 $ADB -s x shell 'sed -n 1,40p'";
+assert.equal(cat(adbVar), "device"); // 变量包装写法也要认出来
+const dev = analyzeBash("adb shell rm -rf /data/x", cwd);
+assert.deepEqual(dev?.keys, ["device:adb"]);
+assert.deepEqual(dev?.targets, []);
+
+// 不能误判成设备操作
+assert.equal(cat("cat ~/.ssh/id_rsa"), "read");
+assert.equal(cat("systemctl restart sshd"), null);
+
+// 设备授权是工具级: 一次授权覆盖本次运行, 但不串到别的工具
+grantKeyValue("device", "device:adb");
+assert.equal(isKeyAllowed("device", "device:adb"), true);
+assert.equal(isKeyAllowed("device", "device:ssh"), false);
+assert.equal(isKeyAllowed("read", "device:adb"), false); // 类别不串
 
 console.log("test-logic OK");
 `;
