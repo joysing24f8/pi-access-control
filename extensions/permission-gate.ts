@@ -205,8 +205,9 @@ function extractPathTokens(command: string): string[] {
     tokens.add(m[1]);
   }
   // 裸 token: 绝对路径 / ~ 开头 / .. 开头 / $HOME、$PWD 展开式
+  // 边界含 "=": `VAR=$HOME/x` 这种赋值也要能提取出来, 否则 `X=$HOME/secret; cat $X` 会绕过门禁
   const bare =
-    /(?:^|[\s;&|(])(\$\{?(?:HOME|PWD)\}?[^\s;&|()>]*|~[^\s;&|()>]*|\/[^\s;&|()>]*|\.\.[^\s;&|()>]*)/g;
+    /(?:^|[\s;&|(=])(\$\{?(?:HOME|PWD)\}?[^\s;&|()>]*|~[^\s;&|()>]*|\/[^\s;&|()>]*|\.\.[^\s;&|()>]*)/g;
   for (const m of command.matchAll(bare)) {
     tokens.add(m[1]);
   }

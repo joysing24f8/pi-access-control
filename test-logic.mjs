@@ -101,6 +101,12 @@ assert.equal(cat("cd sub && echo x > /tmp/out"), "write"); // cd 在里面, 越�
 assert.equal(cat("cd /opt && echo hi > out.txt"), "other"); // cd 真的出去了
 assert.equal(cat("cat /etc/hosts > out.txt"), "read"); // 重定向在里面, 越界的是读
 
+// --- 赋值边界: VAR=$HOME/... 也要提取(否则 X=$HOME/secret; cat $X 能绕过) ---
+assert.equal(cat("ADB=$HOME/tools/platform-tools/adb"), "other"); // 赋值越界; 命令本身不是读写命令 → other
+assert.equal(cat("X=$HOME/secret; cat $X"), "read");
+assert.equal(cat("P=/tmp/x"), "other"); // 纯赋值也拦(宁可多拦)
+assert.equal(cat("FOO=bar"), null); // 没有路径, 不拦
+
 console.log("test-logic OK");
 `;
 
