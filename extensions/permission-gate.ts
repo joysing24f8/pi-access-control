@@ -217,6 +217,24 @@ function extractPathTokens(command: string): string[] {
   return clean;
 }
 
+/** 命令里 cd 的目标(用来区分"真的 cd 出去了"和"只是命令里出现了越界路径") */
+function cdTargets(command: string, cwd: string): string[] {
+  const out: string[] = [];
+  for (const m of command.matchAll(/(?:^|[\s;&|])cd\s+([^\s;&|]+)/g)) {
+    out.push(resolvePath(m[1].replace(/^["']|["']$/g, ""), cwd));
+  }
+  return out;
+}
+
+/** 重定向(> / >>)的目标(用来区分"越界写入是不是真由重定向引起") */
+function redirectTargets(command: string, cwd: string): string[] {
+  const out: string[] = [];
+  for (const m of command.matchAll(/>{1,2}\s*([^\s;&|]+)/g)) {
+    out.push(resolvePath(m[1].replace(/^["']|["']$/g, ""), cwd));
+  }
+  return out;
+}
+
 interface BashFinding {
   category: Category;
   targets: string[]; // resolve 后的绝对路径(越界部分)
@@ -252,10 +270,12 @@ function analyzeBash(command: string, cwd: string): BashFinding | null {
   if (isDelete) {
     return { category: "delete", targets, summary: "删除工作目录之外的文件" };
   }
-  if (/\bcd\b/.test(command)) {
+  // 只看 cd / 重定向的**目标**是否越界, 不看命令里有没有 cd 或 > 。
+  // 否则 `cd <cwd 自身> && $HOME/tools/adb ...` 会被误报成"cd 到工作目录之外"。
+  if (cdTargets(command, cwd).some((p) => !isInside(cwd, p))) {
     return { category: "other", targets, summary: "cd 到工作目录之外" };
   }
-  if (REDIRECT.test(command)) {
+  if (redirectTargets(command, cwd).some((p) => !isInside(cwd, p))) {
     return { category: "write", targets, summary: "重定向写入工作目录之外" };
   }
   if (WRITE_CMDS.test(command)) {

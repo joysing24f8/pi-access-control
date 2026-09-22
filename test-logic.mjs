@@ -93,6 +93,14 @@ grant("delete", "/tmp"); // 目录 → 记成自身
 assert.equal(isAllowed("delete", "/tmp/a/b"), true);
 assert.equal(isAllowed("delete", "/home"), false);
 
+// --- cd / 重定向: 只看目标本身是否越界(误报修复) ---
+const adbLike =
+  'cd /home/u/proj && ADB="$HOME/tools/platform-tools/adb"; export SOCK=tcp:10.0.0.1:5037; timeout 40 $ADB -s x shell sed -n 1,40p';
+assert.equal(cat(adbLike), "read"); // cd 的是 cwd 本身, 越界的只是 $HOME 下的 adb
+assert.equal(cat("cd sub && echo x > /tmp/out"), "write"); // cd 在里面, 越界的是重定向
+assert.equal(cat("cd /opt && echo hi > out.txt"), "other"); // cd 真的出去了
+assert.equal(cat("cat /etc/hosts > out.txt"), "read"); // 重定向在里面, 越界的是读
+
 console.log("test-logic OK");
 `;
 
